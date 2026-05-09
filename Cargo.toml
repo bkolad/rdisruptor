@@ -1,0 +1,23 @@
+[package]
+name = "rdisruptor"
+version = "0.1.0"
+edition = "2021"
+description = "LMAX Disruptor port for Rust (PoC)"
+
+[dependencies]
+
+[dev-dependencies]
+arc-swap = "1.9"
+criterion = "0.5"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures = "0.3"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+debug = true
+lto = "thin"
+codegen-units = 1

@@ -33,6 +33,42 @@ pub trait WaitStrategy: Send + Sync + 'static {
     fn signal(&self) {}
 }
 
+/// Poll a disruptor-owned condition until it produces a result.
+///
+/// A wait strategy is allowed to return spuriously or without invoking its
+/// predicate. Keeping this loop here ensures that only a value returned by
+/// `poll` can authorize progress through the ring-buffer protocol.
+#[inline]
+pub(crate) fn wait_until_some<W, R, P>(wait: &W, mut poll: P) -> R
+where
+    W: WaitStrategy,
+    P: FnMut() -> Option<R>,
+{
+    loop {
+        if let Some(result) = poll() {
+            return result;
+        }
+
+        let mut observed = None;
+        wait.wait_until(|| {
+            if observed.is_some() {
+                return true;
+            }
+
+            if let Some(result) = poll() {
+                observed = Some(result);
+                true
+            } else {
+                false
+            }
+        });
+
+        if let Some(result) = observed {
+            return result;
+        }
+    }
+}
+
 /// Lowest latency, highest CPU usage. Pin the consumer thread.
 pub struct BusySpin;
 
@@ -402,7 +438,29 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
-    use super::{Blocking, Ordering, Parking, ThreadRegistry, WaitStrategy};
+    use super::{wait_until_some, Blocking, Ordering, Parking, ThreadRegistry, WaitStrategy};
+
+    struct SpuriousReturn;
+
+    impl WaitStrategy for SpuriousReturn {
+        fn wait_until<C>(&self, _check: C)
+        where
+            C: FnMut() -> bool,
+        {
+        }
+    }
+
+    #[test]
+    fn wait_until_some_repolls_after_spurious_strategy_returns() {
+        let mut polls = 0;
+        let result = wait_until_some(&SpuriousReturn, || {
+            polls += 1;
+            (polls == 3).then_some(42)
+        });
+
+        assert_eq!(result, 42);
+        assert_eq!(polls, 3);
+    }
 
     #[test]
     fn registry_keeps_nested_registrations_until_each_is_released() {

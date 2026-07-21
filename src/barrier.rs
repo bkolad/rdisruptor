@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::sequence::Sequence;
 use crate::sync::{AtomicBool, Ordering};
-use crate::wait::{WaitResult, WaitStrategy};
+use crate::wait::{wait_until_some, WaitResult, WaitStrategy};
 
 pub(crate) struct SequenceBarrier<W: WaitStrategy> {
     deps: Vec<Arc<Sequence>>,
@@ -48,27 +48,6 @@ impl<W: WaitStrategy> SequenceBarrier<W> {
 
     #[inline]
     pub(crate) fn wait_for(&self, target: i64) -> WaitResult {
-        loop {
-            if let Some(result) = self.poll(target) {
-                return result;
-            }
-
-            let mut observed = None;
-            self.wait.wait_until(|| {
-                if let Some(result) = self.poll(target) {
-                    observed = Some(result);
-                    true
-                } else {
-                    false
-                }
-            });
-
-            // WaitStrategy is a safe extension point and may return without
-            // invoking the predicate. Only a result produced by poll() can
-            // authorize the processor to read a ring-buffer slot.
-            if let Some(result) = observed {
-                return result;
-            }
-        }
+        wait_until_some(self.wait.as_ref(), || self.poll(target))
     }
 }

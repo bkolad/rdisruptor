@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::ring::RingBuffer;
 use crate::sequence::{Sequence, INITIAL};
 use crate::sync::{AtomicBool, Ordering};
-use crate::wait::WaitStrategy;
+use crate::wait::{wait_until_some, WaitStrategy};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublishError {
@@ -78,25 +78,7 @@ impl<T, W: WaitStrategy> SingleProducer<T, W> {
     }
 
     fn wait_for_gate(&self, wrap_point: i64) -> Result<i64, PublishError> {
-        loop {
-            if let Some(result) = self.poll_gate(wrap_point) {
-                return result;
-            }
-
-            let mut observed = None;
-            self.wait.wait_until(|| {
-                if let Some(result) = self.poll_gate(wrap_point) {
-                    observed = Some(result);
-                    true
-                } else {
-                    false
-                }
-            });
-
-            if let Some(result) = observed {
-                return result;
-            }
-        }
+        wait_until_some(self.wait.as_ref(), || self.poll_gate(wrap_point))
     }
 }
 

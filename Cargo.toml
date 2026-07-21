@@ -5,6 +5,7 @@ edition = "2021"
 description = "LMAX Disruptor port for Rust (PoC)"
 
 [dependencies]
+atomic-wait = "1.1"
 
 [dev-dependencies]
 arc-swap = "1.9"

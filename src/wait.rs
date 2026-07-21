@@ -2,7 +2,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, Thread};
 use std::time::Duration;
 
-use crate::sync::{fence, AtomicUsize, Ordering};
+use crate::sync::{fence, wait, wake_all, AtomicU32, Ordering};
 
 pub(crate) enum WaitResult {
     Available(i64),
@@ -305,25 +305,32 @@ impl WaitStrategy for Blocking {
     }
 }
 
-/// Spin, then yield, then park until publication, dependency progress, or
-/// shutdown.
+/// Spin, optionally yield, then block on an atomic generation until
+/// publication, dependency progress, or shutdown.
 ///
-/// The spin and yield phases avoid scheduler round trips for short gaps. Once
-/// the thread reaches the cold phase it announces itself before its final
-/// condition check. [`Self::signal`] uses that announcement as a gate, so the
-/// busy path avoids the registry mutex and thread wakeups when nobody is
-/// parked. Even on that fast path, `signal` executes a sequentially consistent
-/// fence and one relaxed waiter-count load to prevent lost wakeups.
+/// The generation word provides the compare-before-sleep operation through
+/// Linux futexes, macOS libc++ atomic wait, and equivalent primitives on other
+/// supported platforms. Its low bit is an edge-triggered signal gate: one
+/// signal wakes all armed threads, and later signals avoid wake syscalls until
+/// a thread explicitly rearms before checking its condition again.
+///
+/// The atomic-wait backend requires macOS 11 or newer. If the condition becomes
+/// ready after a thread arms the gate but before it sleeps, the thread returns
+/// without clearing the shared bit because other waiters may still need it.
+/// The next signal may therefore perform one harmless wake even when no thread
+/// is asleep; this is expected and can appear as a stray syscall in profiles.
 pub struct Parking {
-    waiters: AtomicUsize,
-    registry: ThreadRegistry,
+    state: AtomicU32,
     spin_tries: u32,
     yield_tries: u32,
 }
 
+const PARKING_ARMED: u32 = 1;
+const PARKING_GENERATION_STEP: u32 = 2;
+
 impl Parking {
     pub const DEFAULT_SPIN_TRIES: u32 = 100;
-    pub const DEFAULT_YIELD_TRIES: u32 = 100;
+    pub const DEFAULT_YIELD_TRIES: u32 = 0;
 
     pub fn new() -> Self {
         Self::with_tries(Self::DEFAULT_SPIN_TRIES, Self::DEFAULT_YIELD_TRIES)
@@ -334,8 +341,7 @@ impl Parking {
     /// immediately.
     pub fn with_tries(spin_tries: u32, yield_tries: u32) -> Self {
         Self {
-            waiters: AtomicUsize::new(0),
-            registry: ThreadRegistry::new(),
+            state: AtomicU32::new(0),
             spin_tries,
             yield_tries,
         }
@@ -345,45 +351,6 @@ impl Parking {
 impl Default for Parking {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-struct WaiterAnnouncement<'a> {
-    waiters: &'a AtomicUsize,
-}
-
-impl<'a> WaiterAnnouncement<'a> {
-    fn new(waiters: &'a AtomicUsize) -> Self {
-        waiters.fetch_add(1, Ordering::SeqCst);
-        Self { waiters }
-    }
-}
-
-impl Drop for WaiterAnnouncement<'_> {
-    fn drop(&mut self) {
-        self.waiters.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-struct ColdRegistration<'a> {
-    // Fields drop in declaration order: leave the registry before lowering
-    // the waiter gate.
-    _thread: ThreadRegistration<'a>,
-    _announcement: WaiterAnnouncement<'a>,
-}
-
-impl<'a> ColdRegistration<'a> {
-    fn new(parking: &'a Parking) -> Self {
-        // Announce before joining the registry, then fence after insertion and
-        // before the final predicate check. If registry insertion panics, the
-        // announcement guard still restores the waiter count.
-        let announcement = WaiterAnnouncement::new(&parking.waiters);
-        let thread = ThreadRegistration::new(&parking.registry);
-        fence(Ordering::SeqCst);
-        Self {
-            _thread: thread,
-            _announcement: announcement,
-        }
     }
 }
 
@@ -410,23 +377,45 @@ impl WaitStrategy for Parking {
             }
         }
 
-        let _registration = ColdRegistration::new(self);
-        while !check() {
-            thread::park();
+        loop {
+            // Arm before the final check. The fence pairs with signal()'s
+            // fence: either signal observes the armed bit and wakes us, or
+            // this final check observes the preceding disruptor state change.
+            let expected = self.state.fetch_or(PARKING_ARMED, Ordering::SeqCst) | PARKING_ARMED;
+            fence(Ordering::SeqCst);
+            if check() {
+                return;
+            }
+
+            wait(&self.state, expected);
         }
     }
 
     fn signal(&self) {
-        // Every state mutation that can satisfy a waiter is sequenced before
-        // this fence. Together with the waiter's fence after registration,
-        // the SC order guarantees one of two outcomes: this load observes the
-        // waiter and signals it, or the waiter's final check observes the state
-        // mutation and never parks. If signaling reaches the registry before
-        // insertion, their shared mutex orders the mutation before that final
-        // check; replacing it with unrelated locks would break the protocol.
+        // The SC fences close the announce/check versus mutate/signal
+        // store-load race. With no armed waiter, the fast path is one fence and
+        // one load; it does not modify a cache line shared with the waiter.
         fence(Ordering::SeqCst);
-        if self.waiters.load(Ordering::Relaxed) != 0 {
-            self.registry.signal_all();
+        let mut current = self.state.load(Ordering::Relaxed);
+
+        while current & PARKING_ARMED != 0 {
+            // Clear the one-shot gate and advance the generation atomically.
+            // Addition by two preserves the armed bit across wraparound until
+            // the mask clears it. Only the successful signaler performs the
+            // OS wake; concurrent signalers observe the cleared gate.
+            let next = current.wrapping_add(PARKING_GENERATION_STEP) & !PARKING_ARMED;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    wake_all(&self.state);
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -435,10 +424,13 @@ impl WaitStrategy for Parking {
 mod tests {
     use std::cell::Cell;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
-    use super::{wait_until_some, Blocking, Ordering, Parking, ThreadRegistry, WaitStrategy};
+    use super::{
+        wait_until_some, Blocking, Ordering, Parking, ThreadRegistry, WaitStrategy, PARKING_ARMED,
+    };
 
     struct SpuriousReturn;
 
@@ -492,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn parking_cold_registration_is_released_when_check_panics() {
+    fn parking_check_panic_does_not_leave_the_signal_gate_stuck() {
         let wait = Parking::with_tries(0, 0);
         let checks = Cell::new(0);
 
@@ -508,25 +500,53 @@ mod tests {
         }));
 
         assert!(result.is_err());
-        assert_eq!(wait.waiters.load(Ordering::SeqCst), 0);
-        assert!(wait.registry.threads().is_empty());
+        assert_ne!(wait.state.load(Ordering::Relaxed) & PARKING_ARMED, 0);
+
+        wait.signal();
+        assert_eq!(wait.state.load(Ordering::Relaxed) & PARKING_ARMED, 0);
     }
 
     #[test]
-    fn parking_signal_does_not_lock_registry_without_waiters() {
-        let wait = Arc::new(Parking::new());
-        let registry_guard = wait.registry.threads();
+    fn parking_does_not_lose_signal_between_final_check_and_wait() {
+        let wait = Arc::new(Parking::with_tries(0, 0));
+        let ready = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let signaler_wait = Arc::clone(&wait);
-        let signaler = std::thread::spawn(move || {
-            signaler_wait.signal();
+
+        let waiter_wait = Arc::clone(&wait);
+        let waiter_ready = Arc::clone(&ready);
+        let waiter_checks = Arc::clone(&checks);
+        let waiter = std::thread::spawn(move || {
+            waiter_wait.wait_until(|| {
+                let check = waiter_checks.fetch_add(1, Ordering::Relaxed);
+                if check == 0 {
+                    return false;
+                }
+                if check == 1 {
+                    armed_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    // Force the signal into the check-to-wait window. The
+                    // changed generation must make atomic_wait return without
+                    // relying on a wake token.
+                    return false;
+                }
+                waiter_ready.load(Ordering::Acquire)
+            });
             done_tx.send(()).unwrap();
         });
 
-        let result = done_rx.recv_timeout(Duration::from_secs(5));
-        drop(registry_guard);
-        signaler.join().unwrap();
+        armed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter did not arm");
+        ready.store(true, Ordering::Release);
+        wait.signal();
+        resume_tx.send(()).unwrap();
 
-        result.expect("signal locked the empty waiter registry");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter lost a signal before atomic_wait");
+        waiter.join().unwrap();
     }
 }

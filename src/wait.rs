@@ -2,7 +2,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, Thread};
 use std::time::Duration;
 
-use crate::sync::{fence, wait, wake_all, AtomicU32, Ordering};
+use crate::sync::{wait, wake_all, AtomicU32, Ordering};
 
 pub(crate) enum WaitResult {
     Available(i64),
@@ -310,9 +310,11 @@ impl WaitStrategy for Blocking {
 ///
 /// The generation word provides the compare-before-sleep operation through
 /// Linux futexes, macOS libc++ atomic wait, and equivalent primitives on other
-/// supported platforms. Its low bit is an edge-triggered signal gate: one
-/// signal wakes all armed threads, and later signals avoid wake syscalls until
-/// a thread explicitly rearms before checking its condition again.
+/// supported platforms. Every signal advances the generation so the hot path is
+/// one locked RMW rather than a standalone sequentially consistent fence. The
+/// low bit is an edge-triggered signal gate: one signal wakes all armed threads,
+/// and later signals avoid wake syscalls until a thread explicitly rearms before
+/// checking its condition again.
 ///
 /// The atomic-wait backend requires macOS 11 or newer. If the condition becomes
 /// ready after a thread arms the gate but before it sleeps, the thread returns
@@ -378,11 +380,11 @@ impl WaitStrategy for Parking {
         }
 
         loop {
-            // Arm before the final check. The fence pairs with signal()'s
-            // fence: either signal observes the armed bit and wakes us, or
-            // this final check observes the preceding disruptor state change.
+            // Arm before the final check. If the signal RMW reaches this atomic
+            // first, our RMW observes it and synchronizes with the preceding
+            // disruptor state change. If our RMW reaches it first, signal
+            // observes the armed bit and wakes us.
             let expected = self.state.fetch_or(PARKING_ARMED, Ordering::SeqCst) | PARKING_ARMED;
-            fence(Ordering::SeqCst);
             if check() {
                 return;
             }
@@ -392,30 +394,15 @@ impl WaitStrategy for Parking {
     }
 
     fn signal(&self) {
-        // The SC fences close the announce/check versus mutate/signal
-        // store-load race. With no armed waiter, the fast path is one fence and
-        // one load; it does not modify a cache line shared with the waiter.
-        fence(Ordering::SeqCst);
-        let mut current = self.state.load(Ordering::Relaxed);
-
-        while current & PARKING_ARMED != 0 {
-            // Clear the one-shot gate and advance the generation atomically.
-            // Addition by two preserves the armed bit across wraparound until
-            // the mask clears it. Only the successful signaler performs the
-            // OS wake; concurrent signalers observe the cleared gate.
-            let next = current.wrapping_add(PARKING_GENERATION_STEP) & !PARKING_ARMED;
-            match self.state.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    wake_all(&self.state);
-                    return;
-                }
-                Err(observed) => current = observed,
-            }
+        // Always advance the generation. Waiters that arm after this RMW
+        // synchronize with it before their final condition check; waiters that
+        // armed before it observe a value mismatch or receive the wake below.
+        let current = self
+            .state
+            .fetch_add(PARKING_GENERATION_STEP, Ordering::Release);
+        if current & PARKING_ARMED != 0 {
+            self.state.fetch_and(!PARKING_ARMED, Ordering::AcqRel);
+            wake_all(&self.state);
         }
     }
 }

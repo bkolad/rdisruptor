@@ -310,9 +310,9 @@ impl WaitStrategy for Blocking {
 ///
 /// The generation word provides the compare-before-sleep operation through
 /// Linux futexes, macOS libc++ atomic wait, and equivalent primitives on other
-/// supported platforms. Linux advances the generation with one atomic RMW on
-/// every signal. Other platforms use a sequentially consistent fence plus an
-/// armed-bit load, advancing the generation only when a waiter is armed. The low
+/// supported platforms. x86 targets advance the generation with one atomic RMW
+/// on every signal. Other architectures use a sequentially consistent fence plus
+/// an armed-bit load, advancing the generation only when a waiter is armed. The low
 /// bit is an edge-triggered signal gate: one signal wakes all armed threads, and
 /// later signals avoid wake syscalls until a thread explicitly rearms before
 /// checking its condition again.
@@ -329,6 +329,15 @@ pub struct Parking {
 }
 
 const PARKING_ARMED: u32 = 1;
+// The generation field is 31 bits. A waiter that computes `expected`, then has
+// exactly 2^31 generation advances land before its wait() call, would sleep on
+// a bitwise-identical stale value; the producer, eventually gated on that
+// consumer, would then deadlock with it. That cannot happen here: generation
+// advances require signal() calls, and signals while any waiter's predicate is
+// false are bounded by ring backpressure to O(capacity × consumers) — every
+// signaler stalls long before 2^31. This bound is a property of the
+// disruptor's call sites, NOT of this protocol; reusing Parking in a setting
+// with unbounded signalers reintroduces the ABA deadlock.
 const PARKING_GENERATION_STEP: u32 = 2;
 
 impl Parking {
@@ -354,13 +363,13 @@ impl Parking {
     fn arm(&self) -> u32 {
         let expected = self.state.fetch_or(PARKING_ARMED, Ordering::SeqCst) | PARKING_ARMED;
 
-        // The non-Linux signal path coordinates through two atomic locations:
+        // The non-x86 signal path coordinates through two atomic locations:
         // disruptor state and this armed bit. Its paired SC fences guarantee
         // that either signal observes the bit or the final predicate check
-        // observes the state mutation. Linux instead updates this generation
+        // observes the state mutation. x86 instead updates this generation
         // on every signal, so the Acquire half of fetch_or provides the needed
         // synchronization without another fence.
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
             fence(Ordering::SeqCst);
         }
 
@@ -449,7 +458,13 @@ impl WaitStrategy for Parking {
     }
 
     fn signal(&self) {
-        if cfg!(target_os = "linux") {
+        // The split is architectural, not OS-specific: on x86 a standalone
+        // SeqCst fence is an expensive mfence while a locked RMW is cheap, so
+        // every signal advances the generation directly. On other
+        // architectures a fence is cheap and skipping the RMW keeps the state
+        // cache line clean. Measured on x86-64 Linux; the non-x86 choice is a
+        // hypothesis until benchmarked there.
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
             self.signal_rmw();
         } else {
             self.signal_fenced();
@@ -520,8 +535,9 @@ mod tests {
         assert!(wait.registry.threads().is_empty());
     }
 
-    #[test]
-    fn parking_check_panic_does_not_leave_the_signal_gate_stuck() {
+    // The protocol tests run against both signal variants directly, so each
+    // platform's build still checks the variant its `signal()` does not select.
+    fn assert_check_panic_does_not_leave_the_signal_gate_stuck(signal: fn(&Parking)) {
         let wait = Parking::with_tries(0, 0);
         let checks = Cell::new(0);
 
@@ -539,12 +555,21 @@ mod tests {
         assert!(result.is_err());
         assert_ne!(wait.state.load(Ordering::Relaxed) & PARKING_ARMED, 0);
 
-        wait.signal();
+        signal(&wait);
         assert_eq!(wait.state.load(Ordering::Relaxed) & PARKING_ARMED, 0);
     }
 
     #[test]
-    fn parking_does_not_lose_signal_between_final_check_and_wait() {
+    fn parking_check_panic_gate_recovers_via_rmw_signal() {
+        assert_check_panic_does_not_leave_the_signal_gate_stuck(Parking::signal_rmw);
+    }
+
+    #[test]
+    fn parking_check_panic_gate_recovers_via_fenced_signal() {
+        assert_check_panic_does_not_leave_the_signal_gate_stuck(Parking::signal_fenced);
+    }
+
+    fn assert_does_not_lose_signal_between_final_check_and_wait(signal: fn(&Parking)) {
         let wait = Arc::new(Parking::with_tries(0, 0));
         let ready = Arc::new(AtomicBool::new(false));
         let checks = Arc::new(AtomicUsize::new(0));
@@ -578,12 +603,22 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("waiter did not arm");
         ready.store(true, Ordering::Release);
-        wait.signal();
+        signal(&wait);
         resume_tx.send(()).unwrap();
 
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("waiter lost a signal before atomic_wait");
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn parking_does_not_lose_rmw_signal_between_final_check_and_wait() {
+        assert_does_not_lose_signal_between_final_check_and_wait(Parking::signal_rmw);
+    }
+
+    #[test]
+    fn parking_does_not_lose_fenced_signal_between_final_check_and_wait() {
+        assert_does_not_lose_signal_between_final_check_and_wait(Parking::signal_fenced);
     }
 }

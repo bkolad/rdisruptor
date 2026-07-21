@@ -83,7 +83,13 @@ fn main() {
         benchmark_strategy("Yielding", Yielding::new),
         benchmark_strategy("Sleeping", Sleeping::new),
         benchmark_strategy("Blocking", Blocking::new),
-        benchmark_strategy("Parking", Parking::new),
+        benchmark_strategy("Parking::with_tries(0, 0)", || Parking::with_tries(0, 0)),
+        benchmark_strategy("Parking::with_tries(100, 0)", || {
+            Parking::with_tries(100, 0)
+        }),
+        benchmark_strategy("Parking::with_tries(100, 100)", || {
+            Parking::with_tries(100, 100)
+        }),
     ];
 
     let busy_spin_throughput = results[0].throughput();

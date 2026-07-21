@@ -3,7 +3,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rdisruptor::{
-    spsc, Blocking, BuildError, BusySpin, Consumer, DisruptorBuilder, PublishError, WaitStrategy,
+    spsc, Blocking, BuildError, BusySpin, Consumer, DisruptorBuilder, Parking, PublishError,
+    WaitStrategy,
 };
 
 struct Collector {
@@ -111,8 +112,7 @@ fn max_batch_size_caps_batches_and_closes_partial_batch() {
     assert_eq!(*batch_ends.lock().unwrap(), vec![2, 5, 7]);
 }
 
-#[test]
-fn wraparound_many_passes() {
+fn assert_wraparound_many_passes<W: WaitStrategy>(wait: W) {
     // capacity 4, send 4096 events => 1024 wraparounds
     let n: usize = 4096;
     let out = Arc::new(Mutex::new(Vec::<u64>::new()));
@@ -125,7 +125,7 @@ fn wraparound_many_passes() {
         expected: n,
     };
 
-    let mut disruptor = spsc::<u64, _, _>(4, BusySpin, consumer).unwrap();
+    let mut disruptor = spsc::<u64, _, _>(4, wait, consumer).unwrap();
     let mut producer = disruptor.producer();
     for i in 0..n as u64 {
         producer.publish(|slot| *slot = i).unwrap();
@@ -138,6 +138,16 @@ fn wraparound_many_passes() {
     for (i, v) in g.iter().enumerate() {
         assert_eq!(*v as usize, i);
     }
+}
+
+#[test]
+fn wraparound_many_passes() {
+    assert_wraparound_many_passes(BusySpin);
+}
+
+#[test]
+fn parking_wraparound_many_passes() {
+    assert_wraparound_many_passes(Parking::with_tries(10, 10));
 }
 
 #[test]
@@ -283,7 +293,11 @@ fn publish_after_shutdown_returns_shutdown() {
 struct EagerIdle;
 
 impl WaitStrategy for EagerIdle {
-    fn idle(&self, _attempt: u32) {}
+    fn wait_until<C>(&self, _check: C)
+    where
+        C: FnMut() -> bool,
+    {
+    }
 }
 
 struct PublicationProbe {
@@ -323,8 +337,7 @@ fn wait_strategy_cannot_expose_unpublished_events() {
     disruptor.shutdown_or_panic();
 }
 
-#[test]
-fn blocking_strategy_wakes_an_idle_consumer() {
+fn assert_strategy_wakes_an_idle_consumer<W: WaitStrategy>(wait: W) {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (event_tx, event_rx) = mpsc::sync_channel(1);
     let consumer = PublicationProbe {
@@ -332,7 +345,7 @@ fn blocking_strategy_wakes_an_idle_consumer() {
         event_tx,
     };
 
-    let mut disruptor = spsc::<u64, _, _>(8, Blocking::new(), consumer).unwrap();
+    let mut disruptor = spsc::<u64, _, _>(8, wait, consumer).unwrap();
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
     // Give the consumer an opportunity to reach park() before publication.
@@ -345,7 +358,16 @@ fn blocking_strategy_wakes_an_idle_consumer() {
 }
 
 #[test]
-fn blocking_strategy_wakes_a_backpressured_producer() {
+fn blocking_strategy_wakes_an_idle_consumer() {
+    assert_strategy_wakes_an_idle_consumer(Blocking::new());
+}
+
+#[test]
+fn parking_strategy_wakes_an_idle_consumer() {
+    assert_strategy_wakes_an_idle_consumer(Parking::with_tries(0, 0));
+}
+
+fn assert_strategy_wakes_a_backpressured_producer<W: WaitStrategy>(wait: W) {
     struct HeldConsumer {
         ready_tx: mpsc::SyncSender<()>,
         release_rx: mpsc::Receiver<()>,
@@ -374,7 +396,7 @@ fn blocking_strategy_wakes_a_backpressured_producer() {
         last_event_tx,
     };
 
-    let mut disruptor = spsc::<u64, _, _>(4, Blocking::new(), consumer).unwrap();
+    let mut disruptor = spsc::<u64, _, _>(4, wait, consumer).unwrap();
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let mut producer = disruptor.producer();
 
@@ -404,7 +426,16 @@ fn blocking_strategy_wakes_a_backpressured_producer() {
 }
 
 #[test]
-fn blocking_strategy_wakes_on_shutdown() {
+fn blocking_strategy_wakes_a_backpressured_producer() {
+    assert_strategy_wakes_a_backpressured_producer(Blocking::new());
+}
+
+#[test]
+fn parking_strategy_wakes_a_backpressured_producer() {
+    assert_strategy_wakes_a_backpressured_producer(Parking::with_tries(0, 0));
+}
+
+fn assert_strategy_wakes_on_shutdown<W: WaitStrategy>(wait: W) {
     struct ReadyConsumer(mpsc::SyncSender<()>);
 
     impl Consumer<u64> for ReadyConsumer {
@@ -416,7 +447,7 @@ fn blocking_strategy_wakes_on_shutdown() {
     }
 
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let disruptor = spsc::<u64, _, _>(8, Blocking::new(), ReadyConsumer(ready_tx)).unwrap();
+    let disruptor = spsc::<u64, _, _>(8, wait, ReadyConsumer(ready_tx)).unwrap();
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     std::thread::sleep(Duration::from_millis(20));
 
@@ -428,6 +459,16 @@ fn blocking_strategy_wakes_on_shutdown() {
         .expect("shutdown did not wake the parked consumer")
         .unwrap();
     shutdown.join().unwrap();
+}
+
+#[test]
+fn blocking_strategy_wakes_on_shutdown() {
+    assert_strategy_wakes_on_shutdown(Blocking::new());
+}
+
+#[test]
+fn parking_strategy_wakes_on_shutdown() {
+    assert_strategy_wakes_on_shutdown(Parking::with_tries(0, 0));
 }
 
 // --- drop counting -----------------------------------------------------------

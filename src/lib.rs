@@ -22,7 +22,7 @@ mod wait;
 pub use builder::{BuildError, Disruptor, DisruptorBuilder, ShutdownError};
 pub use consumer::Consumer;
 pub use producer::{PublishError, SingleProducer};
-pub use wait::{Blocking, BusySpin, Sleeping, WaitStrategy, Yielding};
+pub use wait::{Blocking, BusySpin, Parking, Sleeping, WaitStrategy, Yielding};
 
 /// Convenience for the single-producer / single-consumer case. Equivalent to
 /// `DisruptorBuilder::new().capacity(cap).consumer(consumer).build(wait)`.

@@ -63,6 +63,41 @@ impl<T, W: WaitStrategy> SingleProducer<T, W> {
         }
         m
     }
+
+    fn poll_gate(&self, wrap_point: i64) -> Option<Result<i64, PublishError>> {
+        if self.alert.load(Ordering::Acquire) {
+            return Some(Err(PublishError::Shutdown));
+        }
+
+        let min = self.min_gate();
+        if min >= wrap_point {
+            Some(Ok(min))
+        } else {
+            None
+        }
+    }
+
+    fn wait_for_gate(&self, wrap_point: i64) -> Result<i64, PublishError> {
+        loop {
+            if let Some(result) = self.poll_gate(wrap_point) {
+                return result;
+            }
+
+            let mut observed = None;
+            self.wait.wait_until(|| {
+                if let Some(result) = self.poll_gate(wrap_point) {
+                    observed = Some(result);
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if let Some(result) = observed {
+                return result;
+            }
+        }
+    }
 }
 
 impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
@@ -80,21 +115,7 @@ impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
         let wrap_point = seq - self.capacity;
 
         if self.cached_gate < wrap_point {
-            // Register before checking the gating sequences. If consumer
-            // progress races with the check, notification-based strategies
-            // retain the wakeup until idle() begins.
-            self.wait.register_current_thread();
-            let mut min = self.min_gate();
-            let mut attempt = 0u32;
-            while min < wrap_point {
-                if self.alert.load(Ordering::Acquire) {
-                    return Err(PublishError::Shutdown);
-                }
-                self.wait.idle(attempt);
-                attempt = attempt.saturating_add(1);
-                min = self.min_gate();
-            }
-            self.cached_gate = min;
+            self.cached_gate = self.wait_for_gate(wrap_point)?;
         }
 
         // SAFETY: producer holds exclusive access to slot[seq & mask] until
@@ -105,7 +126,7 @@ impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
         let slot = unsafe { &mut *self.ring.slot_ptr(seq) };
         write(slot);
         self.cursor.set(seq);
-        self.wait.signal_all();
+        self.wait.signal();
 
         self.next_seq = seq + 1;
         Ok(seq)

@@ -304,7 +304,7 @@ impl<T: Default + Send + Sync + 'static> DisruptorBuilder<T> {
                     let result = catch_unwind(AssertUnwindSafe(move || processor.run()));
                     if let Err(payload) = result {
                         worker_alert.store(true, Ordering::Release);
-                        worker_wait.signal_all();
+                        worker_wait.signal();
                         resume_unwind(payload);
                     }
                 });
@@ -318,7 +318,7 @@ impl<T: Default + Send + Sync + 'static> DisruptorBuilder<T> {
                     // Release and join workers that were already started so
                     // they do not remain detached with the ring alive.
                     alert.store(true, Ordering::Release);
-                    wait.signal_all();
+                    wait.signal();
                     let _ = join_workers(&mut handles);
                     return Err(BuildError::SpawnFailed {
                         consumer: consumer_name,
@@ -403,7 +403,7 @@ impl<T: Send + Sync + 'static, W: WaitStrategy> Disruptor<T, W> {
     /// until every consumer's current event completes.
     pub fn shutdown(mut self) -> Result<(), ShutdownError> {
         self.alert.store(true, Ordering::Release);
-        self.wait.signal_all();
+        self.wait.signal();
         let panicked_consumers = join_workers(&mut self.handles);
 
         if panicked_consumers.is_empty() {
@@ -429,7 +429,7 @@ impl<T, W: WaitStrategy> Drop for Disruptor<T, W> {
     fn drop(&mut self) {
         if !self.handles.is_empty() {
             self.alert.store(true, Ordering::Release);
-            self.wait.signal_all();
+            self.wait.signal();
             let _ = join_workers(&mut self.handles);
         }
     }

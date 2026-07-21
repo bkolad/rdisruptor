@@ -5,9 +5,10 @@ pub(crate) struct RingBuffer<T> {
     mask: i64,
 }
 
-unsafe impl<T: Send> Send for RingBuffer<T> {}
-// Consumers in different DAG branches may concurrently read the same slot, so
-// sharing the ring across threads also requires its events to be Sync.
+// Send is derived: `UnsafeCell<T>` is Send when T is Send. Sync needs the
+// manual impl below because UnsafeCell is never Sync. Consumers in different
+// DAG branches may concurrently read the same slot, so sharing the ring across
+// threads also requires its events to be Sync.
 unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
 
 impl<T: Default> RingBuffer<T> {

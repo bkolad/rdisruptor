@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use rdisruptor::{Blocking, BusySpin, Consumer, DisruptorBuilder, PublishError, Yielding};
+use rdisruptor::{
+    Blocking, BusySpin, Consumer, DisruptorBuilder, Parking, PublishError, WaitStrategy, Yielding,
+};
 
 /// Records each (sequence, downstream_observed_upstream_cursor) pair so we
 /// can assert ordering after the run.
@@ -218,8 +220,7 @@ fn yielding_strategy_works_on_dag() {
     assert_eq!(c2.load(Ordering::Acquire), 1000);
 }
 
-#[test]
-fn blocking_strategy_wakes_a_dependent_consumer() {
+fn assert_strategy_wakes_a_dependent_consumer<W: WaitStrategy>(wait: W) {
     struct HoldingUpstream {
         entered_tx: mpsc::SyncSender<()>,
         release_rx: mpsc::Receiver<()>,
@@ -260,7 +261,7 @@ fn blocking_strategy_wakes_a_dependent_consumer() {
         .capacity(8)
         .consumer(upstream)
         .consumer_after(["upstream"], Downstream(done_tx))
-        .build(Blocking::new())
+        .build(wait)
         .unwrap();
 
     let mut producer = disruptor.producer();
@@ -275,6 +276,16 @@ fn blocking_strategy_wakes_a_dependent_consumer() {
     release_tx.send(()).unwrap();
     done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     disruptor.shutdown_or_panic();
+}
+
+#[test]
+fn blocking_strategy_wakes_a_dependent_consumer() {
+    assert_strategy_wakes_a_dependent_consumer(Blocking::new());
+}
+
+#[test]
+fn parking_strategy_wakes_a_dependent_consumer() {
+    assert_strategy_wakes_a_dependent_consumer(Parking::with_tries(0, 0));
 }
 
 struct PanickingConsumer;

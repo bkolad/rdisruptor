@@ -21,37 +21,54 @@ impl<W: WaitStrategy> SequenceBarrier<W> {
     }
 
     #[inline]
-    pub(crate) fn register_current_thread(&self) {
-        self.wait.register_current_thread();
+    pub(crate) fn signal(&self) {
+        self.wait.signal();
     }
 
     #[inline]
-    pub(crate) fn signal_all(&self) {
-        self.wait.signal_all();
+    fn poll(&self, target: i64) -> Option<WaitResult> {
+        if self.is_alerted() {
+            return Some(WaitResult::Alerted);
+        }
+
+        // Sequence::get performs the Acquire loads that make all writes
+        // published by every dependency visible before a slot is read.
+        let available = self
+            .deps
+            .iter()
+            .map(|sequence| sequence.get())
+            .min()
+            .expect("sequence barrier must have at least one dependency");
+        if available >= target {
+            Some(WaitResult::Available(available))
+        } else {
+            None
+        }
     }
 
     #[inline]
     pub(crate) fn wait_for(&self, target: i64) -> WaitResult {
-        let mut attempt = 0u32;
         loop {
-            if self.is_alerted() {
-                return WaitResult::Alerted;
+            if let Some(result) = self.poll(target) {
+                return result;
             }
 
-            // Sequence::get performs the Acquire loads that make all writes
-            // published by every dependency visible before a slot is read.
-            let available = self
-                .deps
-                .iter()
-                .map(|sequence| sequence.get())
-                .min()
-                .expect("sequence barrier must have at least one dependency");
-            if available >= target {
-                return WaitResult::Available(available);
-            }
+            let mut observed = None;
+            self.wait.wait_until(|| {
+                if let Some(result) = self.poll(target) {
+                    observed = Some(result);
+                    true
+                } else {
+                    false
+                }
+            });
 
-            self.wait.idle(attempt);
-            attempt = attempt.saturating_add(1);
+            // WaitStrategy is a safe extension point and may return without
+            // invoking the predicate. Only a result produced by poll() can
+            // authorize the processor to read a ring-buffer slot.
+            if let Some(result) = observed {
+                return result;
+            }
         }
     }
 }

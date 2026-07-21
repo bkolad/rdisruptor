@@ -155,6 +155,7 @@ impl Consumer<Data> for DbWriter {
         // Clone out of the ring slot — we must NOT hold `&Data` (or a future
         // borrowing it / self) across the await, so we buffer owned data.
 
+        /*
         self.pending.push(ev.clone());
         if end_of_batch {
             let client = &self.client;
@@ -166,7 +167,7 @@ impl Consumer<Data> for DbWriter {
                 let writes = batch.iter().map(|o| client.insert(o.id, o.inner.len()));
                 futures::future::join_all(writes).await;
             });
-        }
+        }*/
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rdisruptor::{
-    spsc, BuildError, BusySpin, Consumer, DisruptorBuilder, PublishError, WaitStrategy,
+    spsc, Blocking, BuildError, BusySpin, Consumer, DisruptorBuilder, PublishError, WaitStrategy,
 };
 
 struct Collector {
@@ -321,6 +321,113 @@ fn wait_strategy_cannot_expose_unpublished_events() {
     producer.publish(|slot| *slot = 42).unwrap();
     assert_eq!(event_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
     disruptor.shutdown_or_panic();
+}
+
+#[test]
+fn blocking_strategy_wakes_an_idle_consumer() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (event_tx, event_rx) = mpsc::sync_channel(1);
+    let consumer = PublicationProbe {
+        started_tx,
+        event_tx,
+    };
+
+    let mut disruptor = spsc::<u64, _, _>(8, Blocking::new(), consumer).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    // Give the consumer an opportunity to reach park() before publication.
+    std::thread::sleep(Duration::from_millis(20));
+    let mut producer = disruptor.producer();
+    producer.publish(|slot| *slot = 42).unwrap();
+
+    assert_eq!(event_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    disruptor.shutdown_or_panic();
+}
+
+#[test]
+fn blocking_strategy_wakes_a_backpressured_producer() {
+    struct HeldConsumer {
+        ready_tx: mpsc::SyncSender<()>,
+        release_rx: mpsc::Receiver<()>,
+        last_event_tx: mpsc::SyncSender<()>,
+    }
+
+    impl Consumer<u64> for HeldConsumer {
+        fn on_start(&mut self) {
+            self.ready_tx.send(()).unwrap();
+            self.release_rx.recv().unwrap();
+        }
+
+        fn on_event(&mut self, _event: &u64, sequence: i64, _end_of_batch: bool) {
+            if sequence == 4 {
+                self.last_event_tx.send(()).unwrap();
+            }
+        }
+    }
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (last_event_tx, last_event_rx) = mpsc::sync_channel(1);
+    let consumer = HeldConsumer {
+        ready_tx,
+        release_rx,
+        last_event_tx,
+    };
+
+    let mut disruptor = spsc::<u64, _, _>(4, Blocking::new(), consumer).unwrap();
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut producer = disruptor.producer();
+
+    let (filled_tx, filled_rx) = mpsc::sync_channel(1);
+    let (published_tx, published_rx) = mpsc::sync_channel(1);
+    let publisher = std::thread::spawn(move || {
+        for value in 0..4 {
+            producer.publish(|slot| *slot = value).unwrap();
+        }
+        filled_tx.send(()).unwrap();
+        producer.publish(|slot| *slot = 4).unwrap();
+        published_tx.send(()).unwrap();
+    });
+
+    filled_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        published_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "producer did not block when the ring became full"
+    );
+
+    release_tx.send(()).unwrap();
+    published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    last_event_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    publisher.join().unwrap();
+    disruptor.shutdown_or_panic();
+}
+
+#[test]
+fn blocking_strategy_wakes_on_shutdown() {
+    struct ReadyConsumer(mpsc::SyncSender<()>);
+
+    impl Consumer<u64> for ReadyConsumer {
+        fn on_start(&mut self) {
+            self.0.send(()).unwrap();
+        }
+
+        fn on_event(&mut self, _event: &u64, _sequence: i64, _end_of_batch: bool) {}
+    }
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let disruptor = spsc::<u64, _, _>(8, Blocking::new(), ReadyConsumer(ready_tx)).unwrap();
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+    let shutdown = std::thread::spawn(move || shutdown_tx.send(disruptor.shutdown()).unwrap());
+
+    shutdown_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown did not wake the parked consumer")
+        .unwrap();
+    shutdown.join().unwrap();
 }
 
 // --- drop counting -----------------------------------------------------------

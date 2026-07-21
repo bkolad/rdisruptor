@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use rdisruptor::{BusySpin, Consumer, DisruptorBuilder, PublishError, Yielding};
+use rdisruptor::{Blocking, BusySpin, Consumer, DisruptorBuilder, PublishError, Yielding};
 
 /// Records each (sequence, downstream_observed_upstream_cursor) pair so we
 /// can assert ordering after the run.
@@ -218,6 +218,65 @@ fn yielding_strategy_works_on_dag() {
     assert_eq!(c2.load(Ordering::Acquire), 1000);
 }
 
+#[test]
+fn blocking_strategy_wakes_a_dependent_consumer() {
+    struct HoldingUpstream {
+        entered_tx: mpsc::SyncSender<()>,
+        release_rx: mpsc::Receiver<()>,
+    }
+
+    impl Consumer<u64> for HoldingUpstream {
+        fn name(&self) -> &str {
+            "upstream"
+        }
+
+        fn on_event(&mut self, _event: &u64, _sequence: i64, _end_of_batch: bool) {
+            self.entered_tx.send(()).unwrap();
+            self.release_rx.recv().unwrap();
+        }
+    }
+
+    struct Downstream(mpsc::SyncSender<()>);
+
+    impl Consumer<u64> for Downstream {
+        fn name(&self) -> &str {
+            "downstream"
+        }
+
+        fn on_event(&mut self, _event: &u64, _sequence: i64, _end_of_batch: bool) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let upstream = HoldingUpstream {
+        entered_tx,
+        release_rx,
+    };
+
+    let mut disruptor = DisruptorBuilder::<u64>::new()
+        .capacity(8)
+        .consumer(upstream)
+        .consumer_after(["upstream"], Downstream(done_tx))
+        .build(Blocking::new())
+        .unwrap();
+
+    let mut producer = disruptor.producer();
+    producer.publish(|slot| *slot = 1).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert_eq!(
+        done_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "downstream consumer ran before its dependency advanced"
+    );
+    release_tx.send(()).unwrap();
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    disruptor.shutdown_or_panic();
+}
+
 struct PanickingConsumer;
 
 impl Consumer<u64> for PanickingConsumer {
@@ -253,7 +312,7 @@ fn consumer_panic_alerts_producer_and_is_reported_by_shutdown() {
         .capacity(8)
         .consumer(PanickingConsumer)
         .consumer(ShutdownNotifier { tx: shutdown_tx })
-        .build(BusySpin)
+        .build(Blocking::new())
         .unwrap();
 
     let mut producer = disruptor.producer();

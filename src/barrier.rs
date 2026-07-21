@@ -21,6 +21,16 @@ impl<W: WaitStrategy> SequenceBarrier<W> {
     }
 
     #[inline]
+    pub(crate) fn register_current_thread(&self) {
+        self.wait.register_current_thread();
+    }
+
+    #[inline]
+    pub(crate) fn signal_all(&self) {
+        self.wait.signal_all();
+    }
+
+    #[inline]
     pub(crate) fn wait_for(&self, target: i64) -> WaitResult {
         let mut attempt = 0u32;
         loop {

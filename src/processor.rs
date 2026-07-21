@@ -36,6 +36,10 @@ where
     }
 
     pub(crate) fn run(mut self) {
+        // Notification-based wait strategies must know about this thread
+        // before the first availability check. A signal that races with the
+        // check is then retained by Thread::unpark until idle() calls park().
+        self.barrier.register_current_thread();
         self.consumer.on_start();
         let mut next = 0i64;
         'processing: while let WaitResult::Available(avail) = self.barrier.wait_for(next) {
@@ -61,6 +65,9 @@ where
                 seq += 1;
             }
             self.cursor.set(batch_end);
+            // This progress may release dependent consumers or a producer
+            // blocked by ring-buffer backpressure.
+            self.barrier.signal_all();
             next = batch_end + 1;
         }
         self.consumer.on_shutdown();

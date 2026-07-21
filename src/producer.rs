@@ -80,6 +80,10 @@ impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
         let wrap_point = seq - self.capacity;
 
         if self.cached_gate < wrap_point {
+            // Register before checking the gating sequences. If consumer
+            // progress races with the check, notification-based strategies
+            // retain the wakeup until idle() begins.
+            self.wait.register_current_thread();
             let mut min = self.min_gate();
             let mut attempt = 0u32;
             while min < wrap_point {
@@ -101,6 +105,7 @@ impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
         let slot = unsafe { &mut *self.ring.slot_ptr(seq) };
         write(slot);
         self.cursor.set(seq);
+        self.wait.signal_all();
 
         self.next_seq = seq + 1;
         Ok(seq)

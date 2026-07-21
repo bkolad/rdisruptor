@@ -1,4 +1,5 @@
-use std::thread;
+use std::sync::Mutex;
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 pub(crate) enum WaitResult {
@@ -12,9 +13,24 @@ pub(crate) enum WaitResult {
 /// disruptor; implementations can affect latency and CPU usage, but not the
 /// safety of ring-buffer access.
 pub trait WaitStrategy: Send + Sync + 'static {
+    /// Register the calling thread before it starts checking a condition that
+    /// may require idling.
+    ///
+    /// Notification-based strategies use this hook to avoid missing a signal
+    /// between the availability check and [`Self::idle`]. Polling strategies
+    /// do not need to override it.
+    #[inline]
+    fn register_current_thread(&self) {}
+
     /// Idle after a failed availability check. `attempt` starts at zero for
     /// each wait and saturates at `u32::MAX`.
     fn idle(&self, attempt: u32);
+
+    /// Wake threads that may be idling after sequence or alert state changed.
+    ///
+    /// Polling strategies do not need to override this method.
+    #[inline]
+    fn signal_all(&self) {}
 }
 
 /// Lowest latency, highest CPU usage. Pin the consumer thread.
@@ -104,6 +120,62 @@ impl WaitStrategy for Sleeping {
             thread::yield_now();
         } else {
             thread::sleep(self.sleep);
+        }
+    }
+}
+
+/// Block idle threads until publication, dependency progress, or shutdown.
+///
+/// This strategy uses [`Thread::park`] and [`Thread::unpark`] rather than
+/// periodically polling. It therefore has very low idle CPU usage while still
+/// waking promptly when disruptor state changes. Wakeups are global: all
+/// registered consumer threads, plus any producer thread that encountered
+/// backpressure, are unparked after each progress notification.
+pub struct Blocking {
+    threads: Mutex<Vec<Thread>>,
+}
+
+impl Blocking {
+    pub fn new() -> Self {
+        Self {
+            threads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn threads(&self) -> std::sync::MutexGuard<'_, Vec<Thread>> {
+        self.threads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for Blocking {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WaitStrategy for Blocking {
+    fn register_current_thread(&self) {
+        let current = thread::current();
+        let current_id = current.id();
+        let mut threads = self.threads();
+        if !threads
+            .iter()
+            .any(|registered| registered.id() == current_id)
+        {
+            threads.push(current);
+        }
+    }
+
+    #[inline]
+    fn idle(&self, _attempt: u32) {
+        thread::park();
+    }
+
+    fn signal_all(&self) {
+        for registered in self.threads().iter() {
+            registered.unpark();
         }
     }
 }

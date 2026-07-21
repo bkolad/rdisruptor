@@ -10,11 +10,16 @@ description = "LMAX Disruptor port for Rust (PoC)"
 arc-swap = "1.9"
 criterion = "0.5"
 crossbeam-channel = "0.5"
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 futures = "0.3"
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "strategy_comparison"
 harness = false
 
 [profile.release]

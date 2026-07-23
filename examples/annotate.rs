@@ -1,21 +1,24 @@
-//! Shows how a consumer can update data inside a published ring-buffer event.
-//! `ArcSwap` provides interior mutability, while the consumer dependency makes
-//! sure the reader observes the updater's replacement.
+//! A stage that writes its result INTO the published ring-buffer event with a
+//! plain store — no interior mutability, no per-event allocation, no atomics
+//! inside the handler.
+//!
+//! Registering the stage with `consumer_mut` makes `build()` prove, from the
+//! DAG alone, that it holds exclusive access to each slot while it runs:
+//! every other stage must be an ancestor or a descendant, so no thread can
+//! observe the slot mid-mutation. The downstream reader is gated on the
+//! annotator's cursor and therefore sees the completed mutation.
 
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use rdisruptor::{BusySpin, Consumer, DisruptorBuilder};
+use rdisruptor::{BusySpin, Consumer, DisruptorBuilder, MutConsumer};
 
 const EVENT_COUNT: u64 = 12;
 
 fn main() {
     let (done_tx, done_rx) = sync_channel(1);
 
-    let updater = ArcSwapUpdater;
-    let reader = ArcSwapReader {
+    let reader = Reader {
         values: Vec::with_capacity(EVENT_COUNT as usize),
         done_tx,
     };
@@ -23,10 +26,10 @@ fn main() {
     let mut disruptor = DisruptorBuilder::<Event>::new()
         .capacity(8)
         .max_batch_size(3)
-        .consumer(updater)
-        // The dependency guarantees that the updater has published its
-        // cursor before the reader observes the corresponding event.
-        .consumer_after([updater.name()], reader)
+        .consumer_mut(Annotator)
+        // The dependency guarantees the annotator's cursor — and therefore
+        // its in-place mutation — is visible before the reader runs.
+        .consumer_after(["annotator"], reader)
         .build(BusySpin)
         .expect("consumer graph should be valid");
 
@@ -39,7 +42,7 @@ fn main() {
                 event.input = input;
                 // Ring slots are reused, so clear the previous occupant's
                 // result before publishing this event.
-                event.shared.store(Arc::new(0));
+                event.result = 0;
             })
             .expect("disruptor should still be running");
     }
@@ -48,52 +51,42 @@ fn main() {
     let values = done_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("reader should consume every event before the timeout");
-    println!("values read from ArcSwap: {values:?}");
+    println!("annotated values: {values:?}");
 
     disruptor.shutdown_or_panic();
 }
 
+#[derive(Default)]
 struct Event {
     input: u64,
-    shared: ArcSwap<u64>,
+    result: u64,
 }
 
-impl Default for Event {
-    fn default() -> Self {
-        Self {
-            input: 0,
-            shared: ArcSwap::from_pointee(0),
-        }
-    }
-}
+struct Annotator;
 
-#[derive(Clone, Copy)]
-struct ArcSwapUpdater;
-
-impl Consumer<Event> for ArcSwapUpdater {
+impl MutConsumer<Event> for Annotator {
     fn name(&self) -> &str {
-        "arc_swap_updater"
+        "annotator"
     }
 
-    fn on_event(&mut self, event: &Event, _sequence: i64, _end_of_batch: bool) {
-        event.shared.store(Arc::new(event.input + 100));
+    fn on_event(&mut self, event: &mut Event, _sequence: i64, _end_of_batch: bool) {
+        event.result = event.input + 100;
     }
 }
 
-struct ArcSwapReader {
+struct Reader {
     values: Vec<u64>,
     done_tx: SyncSender<Vec<u64>>,
 }
 
-impl Consumer<Event> for ArcSwapReader {
+impl Consumer<Event> for Reader {
     fn name(&self) -> &str {
-        "arc_swap_reader"
+        "reader"
     }
 
     fn on_event(&mut self, event: &Event, sequence: i64, _end_of_batch: bool) {
-        let value = *event.shared.load_full();
-        assert_eq!(value, event.input + 100);
-        self.values.push(value);
+        assert_eq!(event.result, event.input + 100);
+        self.values.push(event.result);
 
         if sequence == EVENT_COUNT as i64 - 1 {
             let values = std::mem::take(&mut self.values);

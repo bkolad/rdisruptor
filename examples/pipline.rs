@@ -34,12 +34,18 @@ fn main() {
 
     let start = Instant::now();
 
-    let data = Arc::new(vec![1, 2, 3]);
+    // Payload bytes are copied into the slot's reusable buffer. After the
+    // first lap of the ring every slot's Vec has its capacity established, so
+    // steady state publishes with zero allocation — and, unlike a shared
+    // `Arc` payload, zero refcount RMWs on a cache line contended by other
+    // threads.
+    let payload = [1u8, 2, 3];
     for i in 0..TOTAL_EVENTS {
         producer
             .publish(|slot| {
                 slot.id = i;
-                slot.inner = data.clone();
+                slot.payload.clear();
+                slot.payload.extend_from_slice(&payload);
             })
             .unwrap();
     }
@@ -63,10 +69,10 @@ fn main() {
     disruptor.shutdown_or_panic();
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct Data {
     id: u64,
-    inner: Arc<Vec<u8>>,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -121,7 +127,7 @@ struct DbWriter {
     name: &'static str,
     rt: Arc<Runtime>,
     client: Arc<DbClient>,
-    pending: Vec<Data>,
+    pending: Vec<(u64, usize)>,
 }
 
 impl DbWriter {
@@ -152,10 +158,11 @@ impl Consumer<Data> for DbWriter {
     }
 
     fn on_event(&mut self, ev: &Data, _seq: i64, end_of_batch: bool) {
-        // Clone out of the ring slot — we must NOT hold `&Data` (or a future
-        // borrowing it / self) across the await, so we buffer owned data.
+        // We must NOT hold `&Data` (or a future borrowing it / self) across
+        // the await, so buffer the owned scalars the insert actually needs —
+        // no clone of the payload, no refcount traffic against the producer.
 
-        self.pending.push(ev.clone());
+        self.pending.push((ev.id, ev.payload.len()));
         if end_of_batch {
             let client = &self.client;
 
@@ -163,7 +170,7 @@ impl Consumer<Data> for DbWriter {
             std::mem::swap(&mut batch, &mut self.pending);
 
             self.rt.block_on(async move {
-                let writes = batch.iter().map(|o| client.insert(o.id, o.inner.len()));
+                let writes = batch.iter().map(|&(id, bytes)| client.insert(id, bytes));
                 futures::future::join_all(writes).await;
             });
         }

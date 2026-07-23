@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use crate::barrier::SequenceBarrier;
-use crate::consumer::BoxedConsumer;
+use crate::consumer::Stage;
 use crate::ring::RingBuffer;
 use crate::sequence::Sequence;
 use crate::wait::{WaitResult, WaitStrategy};
 
 pub(crate) struct EventProcessor<T, W: WaitStrategy> {
-    consumer: BoxedConsumer<T>,
+    consumer: Stage<T>,
     cursor: Arc<Sequence>,
     barrier: SequenceBarrier<W>,
     ring: Arc<RingBuffer<T>>,
@@ -20,7 +20,7 @@ where
     W: WaitStrategy,
 {
     pub(crate) fn new(
-        consumer: BoxedConsumer<T>,
+        consumer: Stage<T>,
         cursor: Arc<Sequence>,
         barrier: SequenceBarrier<W>,
         ring: Arc<RingBuffer<T>>,
@@ -49,15 +49,33 @@ where
                     break 'processing;
                 }
 
-                // SAFETY: producer published values up to `avail` before
-                // the corresponding cursor.set(); our wait_for did an
-                // Acquire load on that cursor, so all writes to slots
-                // [next..=avail] happen-before this read. The producer
-                // cannot overwrite these slots until our cursor passes
-                // them (gating).
-                let event: &T = unsafe { &*self.ring.slot_ptr(seq) };
                 let end_of_batch = seq == batch_end;
-                self.consumer.on_event(event, seq, end_of_batch);
+                match &mut self.consumer {
+                    Stage::Read(consumer) => {
+                        // SAFETY: producer published values up to `avail`
+                        // before the corresponding cursor.set(); our wait_for
+                        // did an Acquire load on that cursor, so all writes to
+                        // slots [next..=avail] happen-before this read. The
+                        // producer cannot overwrite these slots until our
+                        // cursor passes them (gating).
+                        let event: &T = unsafe { &*self.ring.slot_ptr(seq) };
+                        consumer.on_event(event, seq, end_of_batch);
+                    }
+                    Stage::Mut(consumer) => {
+                        // SAFETY: exclusivity beyond the shared-read argument
+                        // above. build() verified every other stage is an
+                        // ancestor or descendant of this one. Ancestors'
+                        // cursors are >= seq (our barrier Acquire-loaded
+                        // them), so their slot accesses happen-before this
+                        // call and have ended. Descendants gate on our
+                        // cursor, which we Release-store only after this call
+                        // returns, so their accesses happen-after. The
+                        // producer's wrap gate excludes overwrite. Hence no
+                        // other reference to this slot exists right now.
+                        let event: &mut T = unsafe { &mut *self.ring.slot_ptr(seq) };
+                        consumer.on_event(event, seq, end_of_batch);
+                    }
+                }
                 seq += 1;
             }
             self.cursor.set(batch_end);

@@ -20,7 +20,7 @@ mod sync;
 mod wait;
 
 pub use builder::{BuildError, Disruptor, DisruptorBuilder, ShutdownError};
-pub use consumer::Consumer;
+pub use consumer::{Consumer, MutConsumer};
 pub use producer::{PublishError, SingleProducer};
 pub use wait::{Blocking, BusySpin, Parking, Sleeping, WaitStrategy, Yielding};
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crate::barrier::SequenceBarrier;
-use crate::consumer::{BoxedConsumer, Consumer};
+use crate::consumer::{Consumer, MutConsumer, Stage};
 use crate::processor::EventProcessor;
 use crate::producer::SingleProducer;
 use crate::ring::RingBuffer;
@@ -30,6 +30,12 @@ pub enum BuildError {
         dep: String,
     },
     Cycle,
+    /// A mutable consumer has a stage it is not ordered against, so both
+    /// could touch the same slot concurrently.
+    ConcurrentMutConsumer {
+        consumer: String,
+        concurrent: String,
+    },
     SpawnFailed {
         consumer: String,
         kind: std::io::ErrorKind,
@@ -55,6 +61,14 @@ impl std::fmt::Display for BuildError {
                 write!(f, "consumer '{consumer}' depends on unknown '{dep}'")
             }
             Self::Cycle => write!(f, "consumer dependency graph contains a cycle"),
+            Self::ConcurrentMutConsumer {
+                consumer,
+                concurrent,
+            } => write!(
+                f,
+                "mutable consumer '{consumer}' may run concurrently with '{concurrent}'; \
+                 a mutable stage must be an ancestor or descendant of every other stage"
+            ),
             Self::SpawnFailed { consumer, kind } => {
                 write!(f, "failed to spawn consumer '{consumer}' thread: {kind}")
             }
@@ -92,7 +106,7 @@ impl std::error::Error for ShutdownError {}
 struct ConsumerSpec<T> {
     name: String,
     deps: Vec<String>,
-    consumer: BoxedConsumer<T>,
+    consumer: Stage<T>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +175,7 @@ impl<T: Default + Send + Sync + 'static> DisruptorBuilder<T> {
         self.nodes.push(ConsumerSpec {
             name,
             deps: Vec::new(),
-            consumer: Box::new(consumer),
+            consumer: Stage::Read(Box::new(consumer)),
         });
         self
     }
@@ -177,7 +191,46 @@ impl<T: Default + Send + Sync + 'static> DisruptorBuilder<T> {
         self.nodes.push(ConsumerSpec {
             name,
             deps: deps.into_iter().map(|s| s.as_ref().to_string()).collect(),
-            consumer: Box::new(consumer),
+            consumer: Stage::Read(Box::new(consumer)),
+        });
+        self
+    }
+
+    /// Register a mutable consumer that depends only on the producer cursor.
+    ///
+    /// See [`MutConsumer`] for the exclusivity rule enforced by [`build`].
+    ///
+    /// [`build`]: Self::build
+    pub fn consumer_mut<C>(mut self, consumer: C) -> Self
+    where
+        C: MutConsumer<T> + 'static,
+    {
+        let name = consumer.name().to_string();
+        self.nodes.push(ConsumerSpec {
+            name,
+            deps: Vec::new(),
+            consumer: Stage::Mut(Box::new(consumer)),
+        });
+        self
+    }
+
+    /// Register a mutable consumer that depends on all named upstream
+    /// consumers.
+    ///
+    /// See [`MutConsumer`] for the exclusivity rule enforced by [`build`].
+    ///
+    /// [`build`]: Self::build
+    pub fn consumer_after_mut<C, D>(mut self, deps: D, consumer: C) -> Self
+    where
+        C: MutConsumer<T> + 'static,
+        D: IntoIterator,
+        D::Item: AsRef<str>,
+    {
+        let name = consumer.name().to_string();
+        self.nodes.push(ConsumerSpec {
+            name,
+            deps: deps.into_iter().map(|s| s.as_ref().to_string()).collect(),
+            consumer: Stage::Mut(Box::new(consumer)),
         });
         self
     }
@@ -243,6 +296,48 @@ impl<T: Default + Send + Sync + 'static> DisruptorBuilder<T> {
         }
         if topological_order.len() != n {
             return Err(BuildError::Cycle);
+        }
+
+        // 3.5 Mutable stages must be ordered against every other stage.
+        // Reachability along dependency edges is the happens-before order on
+        // any single slot: ancestors finish with a slot before a stage claims
+        // it, descendants wait for its cursor. An incomparable pair can hold
+        // the same slot concurrently, which would alias a &mut.
+        for (i, spec) in self.nodes.iter().enumerate() {
+            if !spec.consumer.is_mut() {
+                continue;
+            }
+            let mut comparable = vec![false; n];
+            comparable[i] = true;
+            // Descendants: forward BFS.
+            let mut stack = vec![i];
+            while let Some(node) = stack.pop() {
+                for &next in &edges[node] {
+                    if !comparable[next] {
+                        comparable[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+            // Ancestors: full sweep in topological order; an ancestor of an
+            // already-marked ancestor (or of i) has a path to i.
+            let mut ancestor = vec![false; n];
+            ancestor[i] = true;
+            for &node in topological_order.iter().rev() {
+                if edges[node]
+                    .iter()
+                    .any(|&next| ancestor[next])
+                {
+                    ancestor[node] = true;
+                    comparable[node] = true;
+                }
+            }
+            if let Some(other) = (0..n).find(|&j| !comparable[j]) {
+                return Err(BuildError::ConcurrentMutConsumer {
+                    consumer: spec.name.clone(),
+                    concurrent: self.nodes[other].name.clone(),
+                });
+            }
         }
 
         let topology = topological_order
@@ -457,6 +552,69 @@ mod tests {
         }
 
         fn on_event(&mut self, _event: &u64, _sequence: i64, _end_of_batch: bool) {}
+    }
+
+    struct NoopMut {
+        name: &'static str,
+    }
+
+    impl crate::MutConsumer<u64> for NoopMut {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn on_event(&mut self, event: &mut u64, sequence: i64, _end_of_batch: bool) {
+            *event = sequence as u64;
+        }
+    }
+
+    #[test]
+    fn mut_consumer_with_incomparable_sibling_is_rejected() {
+        let err = DisruptorBuilder::<u64>::new()
+            .capacity(16)
+            .consumer_mut(NoopMut { name: "annotator" })
+            .consumer(Noop::new("sibling"))
+            .build(BusySpin)
+            .err()
+            .expect("incomparable sibling should be rejected");
+
+        assert_eq!(
+            err,
+            BuildError::ConcurrentMutConsumer {
+                consumer: "annotator".into(),
+                concurrent: "sibling".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn mut_consumer_in_a_chain_builds_and_mutates() {
+        struct AssertMutated;
+
+        impl Consumer<u64> for AssertMutated {
+            fn name(&self) -> &str {
+                "assert_mutated"
+            }
+
+            fn on_event(&mut self, event: &u64, sequence: i64, _end_of_batch: bool) {
+                assert_eq!(*event, sequence as u64);
+            }
+        }
+
+        let mut disruptor = DisruptorBuilder::<u64>::new()
+            .capacity(16)
+            .consumer(Noop::new("upstream_reader"))
+            .consumer_after_mut(["upstream_reader"], NoopMut { name: "annotator" })
+            .consumer_after(["annotator"], AssertMutated)
+            .build(BusySpin)
+            .unwrap();
+
+        let mut producer = disruptor.producer();
+        for _ in 0..64 {
+            producer.publish(|slot| *slot = u64::MAX).unwrap();
+        }
+        drop(producer);
+        disruptor.shutdown_or_panic();
     }
 
     #[test]

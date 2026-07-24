@@ -33,6 +33,7 @@
   slot access so Loom can exercise the actual producer, event processor, and
   ring-buffer protocol rather than only a reduced cursor model.
 
-- [ ] **Test with Miri.** Run the SPSC and DAG tests under Miri to check the
-  unsafe ring-slot pointer accesses, initialization, aliasing, and destruction
-  behavior for undefined behavior.
+- [x] **Test with Miri.** The full test suite runs under Miri in CI
+  (`.github/workflows/miri.yml`) with `-Zmiri-many-seeds` to vary scheduling
+  and weak-memory outcomes. Heavy tests reduce their event counts under
+  `cfg(miri)` while still covering ring wraparound.

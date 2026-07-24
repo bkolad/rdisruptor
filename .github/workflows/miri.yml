@@ -1,0 +1,35 @@
+name: miri
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri:
+    name: cargo miri test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri
+          rustup override set nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Miri
+        run: cargo miri setup
+
+      # Weak-memory emulation and the data-race detector are on by default.
+      # Each seed varies the scheduler and which store a weak-memory load may
+      # observe, so multiple seeds explore orderings a single run would miss.
+      - name: Run tests under Miri
+        run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..4

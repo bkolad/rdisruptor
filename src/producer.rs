@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use crate::ring::RingBuffer;
 use crate::sequence::{Sequence, INITIAL};
-use crate::sync::{AtomicBool, Ordering};
+use crate::sync::{Arc, AtomicBool, Ordering};
 use crate::wait::{wait_until_some, WaitStrategy};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -105,8 +103,8 @@ impl<T: Send + Sync, W: WaitStrategy> SingleProducer<T, W> {
         // No producer overwrites it because next call uses seq + 1, and the
         // wrap_point check guarantees no consumer is still reading the
         // previous occupant at this index.
-        let slot = unsafe { &mut *self.ring.slot_ptr(seq) };
-        write(slot);
+        self.ring
+            .with_slot_mut(seq, |slot| write(unsafe { &mut *slot }));
         self.cursor.set(seq);
         self.wait.signal();
 

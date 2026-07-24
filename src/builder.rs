@@ -1,8 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use crate::barrier::SequenceBarrier;
 use crate::consumer::{BoxedConsumer, Consumer};
@@ -10,7 +8,8 @@ use crate::processor::EventProcessor;
 use crate::producer::SingleProducer;
 use crate::ring::RingBuffer;
 use crate::sequence::Sequence;
-use crate::sync::{AtomicBool, Ordering};
+use crate::sync::thread::{self, JoinHandle};
+use crate::sync::{Arc, AtomicBool, Ordering};
 use crate::wait::WaitStrategy;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -435,7 +434,8 @@ impl<T, W: WaitStrategy> Drop for Disruptor<T, W> {
     }
 }
 
-#[cfg(test)]
+// std-thread test; loom builds only compile tests/loom.rs models.
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use crate::wait::BusySpin;

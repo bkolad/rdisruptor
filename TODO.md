@@ -29,9 +29,12 @@
 
 ## Testing
 
-- [ ] **Loom coverage.** Abstract threads, `Arc`, yielding, and ring
-  slot access so Loom can exercise the actual producer, event processor, and
-  ring-buffer protocol rather than only a reduced cursor model.
+- [x] **Loom coverage.** Every concurrency primitive routes through
+  `src/sync.rs`, which swaps to loom's mocked equivalents under
+  `--features loom`. `tests/loom.rs` model-checks the real producer, event
+  processor, and ring-buffer protocol (loom's `UnsafeCell` fails any
+  interleaving with overlapping slot access); CI runs the models in
+  `.github/workflows/loom.yml`.
 
 - [ ] **Test with Miri.** Run the SPSC and DAG tests under Miri to check the
   unsafe ring-slot pointer accesses, initialization, aliasing, and destruction

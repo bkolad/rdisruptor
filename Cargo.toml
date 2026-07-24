@@ -4,8 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "LMAX Disruptor port for Rust (PoC)"
 
+[features]
+# Model checking only: replaces every concurrency primitive in the library
+# with loom's mocked equivalent (see src/sync.rs and tests/loom.rs). A build
+# with this feature panics outside `loom::model`, so never enable it for
+# normal use — and never build with `--all-features`. A feature is used
+# instead of the conventional `--cfg loom` because that RUSTFLAGS approach
+# rebuilds every dependency with the cfg set, which breaks tokio in our
+# dev-dependencies.
+loom = ["dep:loom"]
+
 [dependencies]
 atomic-wait = "1.1"
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 arc-swap = "1.9"

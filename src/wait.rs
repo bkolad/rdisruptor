@@ -1,8 +1,9 @@
-use std::sync::{Mutex, MutexGuard};
-use std::thread::{self, Thread};
 use std::time::Duration;
 
-use crate::sync::{fence, wait, wake_all, AtomicU32, Ordering};
+use crate::sync::thread::{self, Thread};
+use crate::sync::{
+    fence, sleep, spin_loop, wait, wake_all, AtomicU32, Mutex, MutexGuard, Ordering,
+};
 
 pub(crate) enum WaitResult {
     Available(i64),
@@ -79,7 +80,7 @@ impl WaitStrategy for BusySpin {
         C: FnMut() -> bool,
     {
         while !check() {
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 }
@@ -119,7 +120,7 @@ impl WaitStrategy for Yielding {
         let mut attempt = 0u32;
         while !check() {
             if attempt < self.spin_tries {
-                std::hint::spin_loop();
+                spin_loop();
             } else {
                 thread::yield_now();
             }
@@ -168,11 +169,11 @@ impl WaitStrategy for Sleeping {
         let mut attempt = 0u32;
         while !check() {
             if attempt < self.spin_tries {
-                std::hint::spin_loop();
+                spin_loop();
             } else if attempt < self.spin_tries.saturating_add(self.yield_tries) {
                 thread::yield_now();
             } else {
-                thread::sleep(self.sleep);
+                sleep(self.sleep);
             }
             attempt = attempt.saturating_add(1);
         }
@@ -433,7 +434,7 @@ impl WaitStrategy for Parking {
         }
 
         for _ in 0..self.spin_tries {
-            std::hint::spin_loop();
+            spin_loop();
             if check() {
                 return;
             }
@@ -472,7 +473,8 @@ impl WaitStrategy for Parking {
     }
 }
 
-#[cfg(test)]
+// std-thread/mpsc tests; loom builds only compile tests/loom.rs models.
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use std::cell::Cell;
     use std::panic::{catch_unwind, AssertUnwindSafe};

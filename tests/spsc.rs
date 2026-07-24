@@ -113,8 +113,9 @@ fn max_batch_size_caps_batches_and_closes_partial_batch() {
 }
 
 fn assert_wraparound_many_passes<W: WaitStrategy>(wait: W) {
-    // capacity 4, send 4096 events => 1024 wraparounds
-    let n: usize = 4096;
+    // capacity 4, send 4096 events => 1024 wraparounds. Miri interprets every
+    // instruction, so it gets 64 wraparounds instead.
+    let n: usize = if cfg!(miri) { 256 } else { 4096 };
     let out = Arc::new(Mutex::new(Vec::<u64>::new()));
     let batches = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::sync_channel(1);

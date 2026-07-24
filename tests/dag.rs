@@ -70,7 +70,9 @@ impl Consumer<u64> for Recording {
 
 #[test]
 fn diamond_dag_respects_dependencies() {
-    let n: usize = 10_000;
+    // Miri interprets every instruction, so the full count would take minutes;
+    // 256 events still wraps the capacity-64 ring four times.
+    let n: usize = if cfg!(miri) { 256 } else { 10_000 };
     let out = Arc::new(Mutex::new(Vec::<(String, i64)>::new()));
 
     let a_cursor = Arc::new(AtomicI64::new(-1));
@@ -197,11 +199,13 @@ impl Consumer<u64> for Counter {
 /// Exercise the Yielding wait strategy on the DAG path so it doesn't bit-rot.
 #[test]
 fn yielding_strategy_works_on_dag() {
+    // Reduced under Miri; 128 events still wraps the capacity-16 ring.
+    let n: usize = if cfg!(miri) { 128 } else { 1000 };
     let c1 = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel();
-    let first = Counter::new("first", Arc::clone(&c1), 1000, None);
-    let second = Counter::new("second", Arc::clone(&c2), 1000, Some(tx));
+    let first = Counter::new("first", Arc::clone(&c1), n, None);
+    let second = Counter::new("second", Arc::clone(&c2), n, Some(tx));
 
     let mut disruptor = DisruptorBuilder::<u64>::new()
         .capacity(16)
@@ -211,13 +215,13 @@ fn yielding_strategy_works_on_dag() {
         .unwrap();
 
     let mut producer = disruptor.producer();
-    for i in 0..1000u64 {
+    for i in 0..n as u64 {
         producer.publish(|slot| *slot = i).unwrap();
     }
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
     disruptor.shutdown_or_panic();
-    assert_eq!(c1.load(Ordering::Acquire), 1000);
-    assert_eq!(c2.load(Ordering::Acquire), 1000);
+    assert_eq!(c1.load(Ordering::Acquire), n);
+    assert_eq!(c2.load(Ordering::Acquire), n);
 }
 
 fn assert_strategy_wakes_a_dependent_consumer<W: WaitStrategy>(wait: W) {

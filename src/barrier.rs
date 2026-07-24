@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use crate::sequence::Sequence;
-use crate::sync::{AtomicBool, Ordering};
+use crate::sync::{Arc, AtomicBool, Ordering};
 use crate::wait::{wait_until_some, WaitResult, WaitStrategy};
 
 pub(crate) struct SequenceBarrier<W: WaitStrategy> {

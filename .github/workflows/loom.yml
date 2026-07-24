@@ -1,0 +1,27 @@
+name: loom
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  loom:
+    name: cargo test --features loom
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The loom feature swaps the library's concurrency primitives for
+      # loom's model-checked equivalents; only tests/loom.rs runs models.
+      - name: Run loom models
+        run: cargo test --release --features loom --test loom
